@@ -85,3 +85,25 @@ def test_cross_validate_needs_two_months():
                           'is_training': [0, 1] * 5, **{f: 0 for f in fs.FEATURES}})
     with pytest.raises(ValueError):
         fs.cross_validate(table)
+
+
+def test_events_to_dataframe_keeps_timed_multi_day_events():
+    df = fs.events_to_dataframe([
+        {'start': {'dateTime': '2026-11-01T00:00:00+09:00'}, 'end': {'dateTime': '2026-11-03T00:00:00+09:00'},
+         'summary': '出張'},
+    ])
+    assert df['summary'].tolist() == ['出張']
+
+
+def test_goal_rounds_half_up():
+    start, end = pd.Timestamp('2026-11-16'), pd.Timestamp('2026-12-01')
+    assert fs.goal_in_period({}, 2026, 11, start, end, default=3) == 2
+    assert fs.goal_in_period({}, 2026, 11, start, end, default=5) == 3
+
+
+def test_training_just_before_period_is_used_for_rest_days():
+    start, end = pd.Timestamp('2026-11-01'), pd.Timestamp('2026-12-01')
+    future = events([('2026-10-31 10:00', '2026-10-31 11:00', 'トレーニング')])
+    slots = fs.propose_slots(ConstantModel(), future, start, end, goals={11: 8}, rest_days=1)
+    assert not (slots['start'].dt.normalize() == start).any()
+    assert len(slots) == 8  # 直前のトレーニングは目標回数には数えない

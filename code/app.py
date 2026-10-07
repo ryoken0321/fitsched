@@ -133,6 +133,9 @@ except ValueError as e:
     st.error(str(e))
     st.stop()
 
+if hour_lo >= hour_hi:
+    st.warning('トレーニングしてよい時間帯は、1時間以上の幅で指定してください。')
+    st.stop()
 unwanted_hours = [h for h in range(24) if not hour_lo <= h < hour_hi]
 proposals = fs.propose_slots(model, future_df, start, end, goals, int(daily_limit), unwanted_hours, int(rest_days))
 scheduled = fs.scheduled_trainings(future_df, start, end)
@@ -166,6 +169,8 @@ for tab, p in zip(tabs, periods):
         m_sched = within_month(scheduled_all)
         already = len(fs.in_month(scheduled, p))
         goal = period_goals[(p.year, p.month)]
+        if goal == 0:
+            st.info('提案期間に入る日数が少ないため、この月の目標は0回です。')
         if already:
             st.info(f'カレンダーに入っているトレーニング {already}回を目標に数えています。')
         if already + len(m_props) < goal:

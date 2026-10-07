@@ -1,4 +1,5 @@
 import argparse
+import math
 from datetime import date
 from pathlib import Path
 
@@ -93,9 +94,9 @@ def empty_events():
 
 
 def drop_all_day(df):
-    """終日の予定（誕生日・祝日など）は時間を占有しないので除く。
-    保存済みCSVでは終日予定も「0:00〜翌0:00」の日時になっているため、
-    Googleカレンダー・CSVのどちらでも「0時ちょうどに始まり0時ちょうどに終わる予定」を終日とみなす"""
+    """保存済みCSVから終日の予定（誕生日・祝日など）を除く。
+    CSVでは終日予定も「0:00〜翌0:00」の日時になっていて区別できないため、
+    0時ちょうどに始まり0時ちょうどに終わる予定を終日とみなす（Googleカレンダーからは date の有無で判定する）"""
     all_day = (df['start'] == df['start'].dt.normalize()) & (df['end'] == df['end'].dt.normalize())
     return df[~all_day].reset_index(drop=True)
 
@@ -113,7 +114,7 @@ def events_to_dataframe(events):
     df = pd.DataFrame(data, columns=['start', 'end', 'summary'])
     df['start'] = pd.to_datetime(df['start']).astype('datetime64[ns]')
     df['end'] = pd.to_datetime(df['end']).astype('datetime64[ns]')
-    return drop_all_day(df)
+    return df
 
 
 def load_events_csv(path):
@@ -298,7 +299,8 @@ def goal_in_period(goals, year, month, start, end, default=DEFAULT_MONTHLY_GOAL)
     m_start = pd.Timestamp(year, month, 1)
     m_end = m_start + pd.DateOffset(months=1)
     covered = max(min(end, m_end) - max(start, m_start), pd.Timedelta(0))
-    return round(monthly_goal(goals, year, month, default) * (covered / (m_end - m_start)))
+    # Python の round は 0.5 を偶数側に丸める（2.5→2）ので、四捨五入にする
+    return math.floor(monthly_goal(goals, year, month, default) * (covered / (m_end - m_start)) + 0.5)
 
 
 def scheduled_trainings(future_df, start, end):
@@ -327,14 +329,20 @@ def propose_slots(model, future_df, start, end, goals=MONTHLY_TRAINING_GOAL,
 
     # 日付 → その日のトレーニング回数（予定済み + 提案済み）
     day_count = scheduled_trainings(future_df, start, end)['start'].dt.normalize().value_counts().to_dict()
+    # 期間の直前・直後に入っているトレーニングも、休息日の判定にだけ使う（目標回数には数えない）
+    margin = pd.Timedelta(days=rest_days)
+    outside = scheduled_trainings(future_df, start - margin, end + margin)
+    outside = outside[(outside['start'] < start) | (outside['start'] >= end)]
+    nearby = set(outside['start'].dt.normalize())
 
     def too_close(day, gap):
-        return any(day_count.get(day + sign * pd.Timedelta(days=k), 0) > 0
-                   for k in range(1, gap + 1) for sign in (1, -1))
+        return any(day_count.get(near, 0) > 0 or near in nearby
+                   for k in range(1, gap + 1) for sign in (1, -1)
+                   for near in [day + sign * pd.Timedelta(days=k)])
 
     selected, chosen = [], set()
     for (year, month), month_slots in candidates.groupby(
-            [candidates['start'].dt.year, candidates['start'].dt.month], sort=False):
+            [candidates['start'].dt.year, candidates['start'].dt.month]):
         already = sum(n for d, n in day_count.items() if (d.year, d.month) == (year, month))
         remaining = goal_in_period(goals, year, month, start, end, default_goal) - already
         for gap in range(rest_days, -1, -1):
@@ -363,9 +371,11 @@ def load_from_google(year, start, end):
         pd.Timestamp(f'{year + 1}-01-01', tz=LOCAL_TZ).isoformat()))
     # 次回からオフライン（CSVモード）でも試せるように学習データを保存しておく
     history_df.to_csv(DATA_DIR / f'{year}_calendar_events.csv', index=False)
+    # 期間の前後1週間も取っておき、直前・直後のトレーニングを休息日の判定に使う
+    margin = pd.Timedelta(days=7)
     future_df = events_to_dataframe(get_calendar_events(
         service, calendar_id,
-        start.tz_localize(LOCAL_TZ).isoformat(), end.tz_localize(LOCAL_TZ).isoformat()))
+        (start - margin).tz_localize(LOCAL_TZ).isoformat(), (end + margin).tz_localize(LOCAL_TZ).isoformat()))
     return history_df, future_df
 
 
@@ -388,7 +398,9 @@ def print_proposals(optimal_slots, scheduled, start, end, months, default_goal=D
         already = len(in_month(scheduled, period))
         label = f'{period.year}年{period.month}月'
         note = f'（予定済み {already}回 + 提案 {len(month_slots)}回）' if already else ''
-        if already + len(month_slots) < goal:
+        if goal == 0 and not already:
+            print(f'\n{label}: 提案期間に入る日数が少ないため、目標は0回です。')
+        elif already + len(month_slots) < goal:
             print(f'\n{label}: 希望のトレーニング回数 {goal}回に対して、{already + len(month_slots)}回です{note}。')
         else:
             print(f'\n{label}: 提案されたトレーニングスロット{note}')
