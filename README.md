@@ -1,43 +1,46 @@
 # Fitsched
 
-Googleカレンダーの過去の予定から「トレーニング」をしやすい時間帯を学習し、
+Googleカレンダーの過去の予定から「トレーニングをしやすい時間帯」を学習し、
 これからの空き時間にトレーニング枠を提案するツールです。
 
-## セットアップ
+![アプリの画面](docs/img/app.png)
+
+## すぐに試す（デモ）
+
+カレンダーの認証情報が無くても、疑似カレンダー（`code/synth.py`）でそのまま動きます。
 
 ```sh
-python3.11 -m venv .venv
+python3 -m venv .venv
 .venv/bin/pip install -r code/requirements.txt
+
+.venv/bin/streamlit run code/app.py        # 画面で使う（http://localhost:8501）
+.venv/bin/python code/fitsched.py          # コマンドラインで使う
 ```
 
-## アプリ（画面）で使う
-
-```sh
-.venv/bin/streamlit run code/app.py
-```
-
-または Finder で `Fitsched.command` をダブルクリック。ブラウザで http://localhost:8501 が開き、
-期間・月ごとの目標回数・トレーニングしてよい時間帯を変えると、その場で提案が更新されます。
+画面では、期間・月ごとの目標回数・トレーニングしてよい時間帯を変えると、その場で提案が更新されます。
 `http://localhost:8501/?start=2026-10-01` のように URL で提案の開始日を指定することもできます。
 
-## コマンドラインで使う
+## データの選び方
+
+`--source auto`（既定）は、次の順に使えるものを選びます。
+
+| モード | 条件 | 内容 |
+|---|---|---|
+| `google` | `data/credentials.json` か `data/token.json` がある | Googleカレンダーから学習用の年と提案期間の予定を取得 |
+| `csv` | `data/2023_calendar_events.csv` がある | 保存済みの予定で学習（提案期間は予定なし扱い、`--future-csv` で指定も可） |
+| `demo` | 上のどちらも無い | 疑似カレンダーで学習・提案 |
+
+CSV は `start,end,summary` の3列です（例: `2023-04-10 10:00:00,2023-04-10 11:00:00,トレーニング`）。
+`summary` に「トレーニング」を含む予定を、トレーニングの実績として扱います。終日の予定は時間を占有しないので除きます。
 
 ```sh
-# data/credentials.json が無ければ、data/2023_calendar_events.csv で学習（提案期間は予定なし扱い）
-.venv/bin/python code/Fitshed.py
-
-# 期間を指定
-.venv/bin/python code/Fitshed.py --start 2026-10-01 --months 3
-
-# 提案期間の予定をCSVで渡す（start,end,summary 列）
-.venv/bin/python code/Fitshed.py --future-csv data/future_events.csv
+.venv/bin/python code/fitsched.py --start 2026-10-01 --months 3
+.venv/bin/python code/fitsched.py --source csv --history-csv my_events.csv --future-csv my_future.csv
 ```
 
-主なオプション: `--source {auto,google,csv}` / `--history-year` / `--rest-days`（練習の間に空ける休息日数）/ `--plot`（時間帯のヒストグラムを表示）
+主なオプション: `--history-year`（学習に使う年）/ `--rest-days`（練習の間に空ける休息日数）/ `--plot`（時間帯のヒストグラムを表示）
 
-月ごとの目標回数・1日の上限・避けたい時間帯は `code/Fitshed.py` 冒頭の定数で変更できます。
-
-## Googleカレンダーから取得する場合
+### Googleカレンダーから取得する場合
 
 1. Google Cloud Console で Calendar API を有効化し、OAuth クライアント（デスクトップアプリ）を作成
 2. ダウンロードした JSON を `data/credentials.json` として置く
@@ -45,14 +48,39 @@ python3.11 -m venv .venv
 
 `data/` は `.gitignore` 済みです（個人の予定・認証情報を含むため）。
 
-## モデルの評価
+## 仕組み
+
+1. **学習データ**: 学習に使う年を1時間ごとの枠に分け、「トレーニング」の予定と重なる枠を正例にします。
+   深夜（22〜6時）とほかの予定と重なる枠はそもそも候補にならないので、学習から除きます。
+2. **特徴量**: 時刻・曜日・週末かどうか・同じ日の直前の予定からの間隔・直後の予定までの間隔・その日の予定の合計時間の6つ。
+   「授業の直後に行く」「直後に予定があると避ける」といった習慣を捉えるためです。
+3. **モデル**: ランダムフォレスト（300本、葉の最小サンプル数20）。
+4. **提案**: 提案期間の空き枠を、予測確率の高い順に、月ごとの目標回数・1日の上限・休息日（前後の日を空ける）を守って選びます。
+   カレンダーに入っているトレーニングは目標回数に数えます。休息日を守ると目標に届かない月だけ、休息日を1日ずつ減らして埋めます。
+
+## 評価
+
+トレーニングの枠は候補全体の数%しかないため、正解率ではなく並び順の指標（ROC-AUC・Average Precision）で見ます。
+評価は**月ごとに分けた交差検証**です。評価する月のデータは学習に使わないので、隣り合う時間枠から答えが漏れることがありません。
+
+| データ | ROC-AUC | Average Precision（当てずっぽうの値） |
+|---|---|---|
+| 作者の実カレンダー（2023年、トレーニング99回） | 0.82 | 0.13（0.03） |
+| 疑似データ seed=0 | 0.64 | 0.034（0.022） |
+
+疑似データは「朝型・授業直後・週末夕方」という決まった習慣でトレーニングを入れているため、
+各枠の本当の確率が分かります。`code/evaluate.py` では、モデルの予測がその並び順をどこまで再現できるか（正解との相関）と、
+本当の確率を使った場合の上限も一緒に出し、特徴量や評価方法の良し悪しを確かめています。
 
 ```sh
 .venv/bin/python code/evaluate.py
 ```
 
-旧モデルと新モデルを、実データ（2023年）と疑似データ（`code/synth.py`）で比べます。
-疑似データは「朝型・授業直後・週末夕方」という決まった習慣でトレーニングを入れているため、
-モデルが本当の習慣をどこまで再現できるか（正解との相関）を測れます。
+## ファイル構成
 
-カレンダーにすでに入っている「トレーニング」は目標回数に数え、その前後の日は休息日として避けます。
+```
+code/fitsched.py   学習・提案の本体とコマンドライン
+code/app.py        Streamlit の画面
+code/synth.py      検証・デモ用の疑似カレンダー生成
+code/evaluate.py   特徴量・評価方法の比較
+```

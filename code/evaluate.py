@@ -1,11 +1,14 @@
-"""旧モデルと新モデルを、実データと疑似データで比べる（実行: .venv/bin/python code/evaluate.py）"""
+"""旧モデルと新モデルを、実データと疑似データで比べる（実行: python code/evaluate.py）
+
+実データ（data/2023_calendar_events.csv）が無い環境では疑似データだけで比べる。
+"""
 import pandas as pd
 from scipy.stats import spearmanr
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 
-import Fitshed as fs
+import fitsched as fs
 import synth
 
 YEAR = 2023
@@ -64,7 +67,8 @@ def evaluate(name, history_df, truth_df=None):
 
 def main():
     print('旧評価以外は、候補枠（6〜22時・他の予定なし）で月ごとに分けた交差検証。AP の当てずっぽう値はトレーニング枠の割合。')
-    evaluate('実データ 2023年', fs.load_events_csv(fs.HISTORY_CSV))
+    if fs.HISTORY_CSV.exists():
+        evaluate('実データ 2023年', fs.load_events_csv(fs.HISTORY_CSV))
     for seed in range(3):
         events, truth = synth.generate(YEAR, seed=seed)
         evaluate(f'疑似データ seed={seed}', events, truth)

@@ -81,7 +81,6 @@ def generate(year=2023, seed=0):
             add(h, h + 1, 'トレーニング')
 
     events_df = pd.DataFrame(events, columns=['start', 'end', 'summary']).sort_values('start', ignore_index=True)
-    events_df['duration'] = (events_df['end'] - events_df['start']).dt.total_seconds() / 60.0
     truth_df = pd.DataFrame(truth, columns=['start', 'true_prob'])
     return events_df, truth_df
 

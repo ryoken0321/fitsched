@@ -1,11 +1,11 @@
-"""Fitsched の Web 画面（起動: .venv/bin/streamlit run code/app.py）"""
+"""Fitsched の Web 画面（起動: streamlit run code/app.py）"""
 from datetime import date
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-import Fitshed as fs
+import fitsched as fs
 
 WEEKDAYS_JA = '月火水木金土日'
 PROPOSAL_COLOR = '#2a78d6'
@@ -19,8 +19,9 @@ st.set_page_config(page_title='Fitsched', page_icon='🏋️', layout='wide')
 def load_events(source, year, start, end):
     if source == 'google':
         return fs.load_from_google(year, start, end)
-    history_df = fs.load_events_csv(fs.HISTORY_CSV)
-    return history_df, pd.DataFrame(columns=['start', 'end', 'summary'])
+    if source == 'demo':
+        return fs.load_demo(year, start, end)
+    return fs.load_events_csv(fs.HISTORY_CSV), fs.empty_events()
 
 
 @st.cache_resource(show_spinner='過去のトレーニングから学習しています…')
@@ -85,12 +86,11 @@ def month_chart(busy, scheduled, proposals, month_start, hour_lo, hour_hi):
 # ---- サイドバー: 条件 ----
 with st.sidebar:
     st.header('条件')
-    google_ready = fs.default_source() == 'google'
-    source = st.radio(
-        'データ', ['google', 'csv'], index=0 if google_ready else 1,
-        format_func=lambda s: 'Googleカレンダー' if s == 'google' else '保存済みCSV（予定なし扱い）',
-        disabled=not google_ready,
-        help=None if google_ready else 'data/credentials.json を置くとGoogleカレンダーを使えます')
+    SOURCE_LABELS = {'google': 'Googleカレンダー', 'csv': '保存済みCSV（予定なし扱い）', 'demo': 'デモ（疑似データ）'}
+    sources = [s for s, ok in [('google', fs.CLIENT_SECRET_FILE.exists() or fs.TOKEN_FILE.exists()),
+                               ('csv', fs.HISTORY_CSV.exists()), ('demo', True)] if ok]
+    source = st.radio('データ', sources, format_func=SOURCE_LABELS.get,
+                      help='data/credentials.json を置くとGoogleカレンダーを使えます')
     year = st.number_input('学習に使う年', min_value=2015, max_value=date.today().year,
                            value=2023)
     # URL の ?start=YYYY-MM-DD で開始日を指定できる（期間を固定した画面を共有するとき用）
@@ -128,12 +128,13 @@ try:
     history_df, future_df = load_events(source, int(year), start, end)
 except Exception as e:  # 認証切れ・ネットワークなど
     st.error(f'カレンダーを読み込めませんでした: {e}')
-    st.info('認証が切れている場合は data/token.json を削除して再読み込みすると、ブラウザで再認証できます。')
+    if source == 'google':
+        st.info('認証が切れている場合は data/token.json を削除して再読み込みすると、ブラウザで再認証できます。')
     st.stop()
 
 try:
     model, _, metrics = train(history_df, int(year))
-except SystemExit as e:
+except ValueError as e:
     st.error(str(e))
     st.stop()
 
@@ -149,7 +150,9 @@ c2.metric(f'{year}年のトレーニング実績', f"{metrics['training_count']}
 c3.metric('モデルの判別力 (ROC-AUC)', f"{metrics['roc_auc']:.2f}",
           help='0.5で当てずっぽう、1.0で完璧。月ごとに分け、学習に使っていない月で測った値です。')
 
-if source == 'csv':
+if source == 'demo':
+    st.info('デモモードです。synth.py が作った疑似カレンダー（授業・バイト・トレーニングの習慣）で学習・提案しています。')
+elif source == 'csv':
     st.warning('CSVモードでは提案期間の予定が分からないため、すべて空いているものとして提案しています。')
 
 busy_all = split_by_day(future_df[~fs.is_training_event(future_df)], start, end, hour_lo, hour_hi)

@@ -1,5 +1,4 @@
 import argparse
-import calendar
 from datetime import date
 from pathlib import Path
 
@@ -9,7 +8,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import GroupKFold
 
-# パスはこのファイルからの相対で解決する（Fitsched/data/ 以下）
+# パスはこのファイルからの相対で解決する（リポジトリ直下の data/ 以下）
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / 'data'
 CLIENT_SECRET_FILE = DATA_DIR / 'credentials.json'
@@ -85,35 +84,62 @@ def get_calendar_events(service, calendar_id, time_min, time_max):
 
 
 def to_local_naive(value):
-    """dateTime（タイムゾーン付き）は日本時間に揃え、date（終日）はそのまま日付として扱う"""
+    """タイムゾーン付きの日時を日本時間に揃え、タイムゾーン情報を外す"""
     ts = pd.Timestamp(value)
     if ts.tzinfo is not None:
         ts = ts.tz_convert(LOCAL_TZ).tz_localize(None)
     return ts
 
 
+def empty_events():
+    """予定が無いときの空の表（列の型を日時にしておかないと .dt が使えない）"""
+    return pd.DataFrame({
+        'start': pd.Series(dtype='datetime64[ns]'),
+        'end': pd.Series(dtype='datetime64[ns]'),
+        'summary': pd.Series(dtype='object'),
+    })
+
+
+def drop_all_day(df):
+    """終日の予定（誕生日・祝日など）は時間を占有しないので除く。
+    0時ちょうどに始まって0時ちょうどに終わる予定を終日とみなす（保存済みCSVにも使えるように）"""
+    all_day = (df['start'] == df['start'].dt.normalize()) & (df['end'] == df['end'].dt.normalize())
+    return df[~all_day].reset_index(drop=True)
+
+
 def events_to_dataframe(events):
-    """イベントデータをDataFrameに変換する"""
+    """イベントデータをDataFrameに変換する。終日の予定（start.date のみ）は除く"""
     data = []
     for event in events:
-        start = event['start'].get('dateTime', event['start'].get('date'))
-        end = event['end'].get('dateTime', event['end'].get('date'))
-        summary = event.get('summary', 'No Title')
-        data.append([to_local_naive(start), to_local_naive(end), summary])
-
+        if 'dateTime' not in event['start']:
+            continue
+        data.append([to_local_naive(event['start']['dateTime']), to_local_naive(event['end']['dateTime']),
+                     event.get('summary', 'No Title')])
+    if not data:
+        return empty_events()
     df = pd.DataFrame(data, columns=['start', 'end', 'summary'])
-    df['start'] = pd.to_datetime(df['start'])
-    df['end'] = pd.to_datetime(df['end'])
-    df['duration'] = (df['end'] - df['start']).dt.total_seconds() / 60.0
+    df['start'] = pd.to_datetime(df['start']).astype('datetime64[ns]')
+    df['end'] = pd.to_datetime(df['end']).astype('datetime64[ns]')
     return df
 
 
 def load_events_csv(path):
-    """保存済みCSVからイベントを読み込む"""
+    """保存済みCSV（start,end,summary 列）からイベントを読み込む"""
     df = pd.read_csv(path)
-    df['start'] = pd.to_datetime(df['start'])
-    df['end'] = pd.to_datetime(df['end'])
-    return df
+    # 終日予定は「2023-01-01」、時刻ありは「2023-01-02 10:00:00」のように形式が混ざることがある
+    df['start'] = pd.to_datetime(df['start'], format='ISO8601').astype('datetime64[ns]')
+    df['end'] = pd.to_datetime(df['end'], format='ISO8601').astype('datetime64[ns]')
+    return drop_all_day(df)
+
+
+def load_demo(year, start, end):
+    """data/ が無い人向けのデモ。synth.py の疑似カレンダーで学習し、提案期間の予定も疑似データで埋める"""
+    import synth
+
+    history_df, _ = synth.generate(year, seed=0)
+    future = pd.concat([synth.generate(y, seed=1)[0] for y in range(start.year, end.year + 1)])
+    future = future[(future['start'] >= start) & (future['start'] < end) & ~is_training_event(future)]
+    return history_df, future.reset_index(drop=True)
 
 
 def create_slots(start_date, end_date, freq='60min'):
@@ -231,7 +257,7 @@ def train_model(history_df, year, unwanted_hours=UNWANTED_HOURS):
     table = build_training_table(history_df, year, unwanted_hours)
     y = table['is_training']
     if y.sum() == 0:
-        raise SystemExit(f'「{TRAINING_KEYWORD}」を含む予定が{year}年に見つかりませんでした。')
+        raise ValueError(f'「{TRAINING_KEYWORD}」を含む予定が{year}年に見つかりませんでした。')
 
     # トレーニング枠は候補のうち数%しかないので、Accuracy ではなく並び順の指標で見る
     oof = cross_validate(table)
@@ -288,7 +314,7 @@ def propose_slots(model, future_df, start, end, goals=MONTHLY_TRAINING_GOAL,
         return any(day_count.get(day + sign * pd.Timedelta(days=k), 0) > 0
                    for k in range(1, gap + 1) for sign in (1, -1))
 
-    selected = []
+    selected, chosen = [], set()
     for (year, month), month_slots in candidates.groupby(
             [candidates['start'].dt.year, candidates['start'].dt.month], sort=False):
         already = sum(n for d, n in day_count.items() if (d.year, d.month) == (year, month))
@@ -298,10 +324,11 @@ def propose_slots(model, future_df, start, end, goals=MONTHLY_TRAINING_GOAL,
                 if remaining <= 0:
                     break
                 day = slot['start'].normalize()
-                if idx in selected or day_count.get(day, 0) >= daily_limit or too_close(day, gap):
+                if idx in chosen or day_count.get(day, 0) >= daily_limit or too_close(day, gap):
                     continue
                 day_count[day] = day_count.get(day, 0) + 1
                 selected.append(idx)
+                chosen.add(idx)
                 remaining -= 1
 
     return future_slots.loc[selected].sort_values('start')
@@ -311,9 +338,12 @@ def load_from_google(year, start, end):
     """Googleカレンダーから学習用の予定と提案期間の予定を取得する"""
     service = get_calendar_service()
     calendar_id = 'primary'
+    # 年の区切りも日本時間で揃える
     history_df = events_to_dataframe(get_calendar_events(
-        service, calendar_id, f'{year}-01-01T00:00:00Z', f'{year + 1}-01-01T00:00:00Z'))
-    # 学習データを保存
+        service, calendar_id,
+        pd.Timestamp(f'{year}-01-01', tz=LOCAL_TZ).isoformat(),
+        pd.Timestamp(f'{year + 1}-01-01', tz=LOCAL_TZ).isoformat()))
+    # 次回からオフライン（CSVモード）でも試せるように学習データを保存しておく
     history_df.to_csv(DATA_DIR / f'{year}_calendar_events.csv', index=False)
     future_df = events_to_dataframe(get_calendar_events(
         service, calendar_id,
@@ -322,7 +352,10 @@ def load_from_google(year, start, end):
 
 
 def default_source():
-    return 'google' if CLIENT_SECRET_FILE.exists() or TOKEN_FILE.exists() else 'csv'
+    """認証情報があればGoogleカレンダー、保存済みCSVがあればCSV、どちらも無ければデモ"""
+    if CLIENT_SECRET_FILE.exists() or TOKEN_FILE.exists():
+        return 'google'
+    return 'csv' if HISTORY_CSV.exists() else 'demo'
 
 
 def in_month(df, period):
@@ -335,7 +368,7 @@ def print_proposals(optimal_slots, scheduled, start, months):
         goal = monthly_goal(MONTHLY_TRAINING_GOAL, period.year, period.month)
         month_slots = in_month(optimal_slots, period)
         already = len(in_month(scheduled, period))
-        label = f'{calendar.month_name[period.month]} {period.year}'
+        label = f'{period.year}年{period.month}月'
         note = f'（予定済み {already}回 + 提案 {len(month_slots)}回）' if already else ''
         if already + len(month_slots) < goal:
             print(f'\n{label}: 希望のトレーニング回数 {goal}回に対して、{already + len(month_slots)}回です{note}。')
@@ -349,15 +382,15 @@ def parse_args():
     today = date.today()
     next_month = date(today.year + today.month // 12, today.month % 12 + 1, 1)
     parser = argparse.ArgumentParser(description='過去のカレンダーから最適なトレーニング時間を提案する')
-    parser.add_argument('--source', choices=['auto', 'google', 'csv'], default='auto',
-                        help='auto: data/credentials.json があればGoogleカレンダー、無ければCSVを使う')
+    parser.add_argument('--source', choices=['auto', 'google', 'csv', 'demo'], default='auto',
+                        help='auto: 認証情報があればGoogleカレンダー、保存済みCSVがあればCSV、無ければ疑似データのデモ')
     parser.add_argument('--history-year', type=int, default=2023, help='学習に使う年')
     parser.add_argument('--history-csv', type=Path, default=HISTORY_CSV,
                         help='CSVモードで学習に使う予定データ')
     parser.add_argument('--future-csv', type=Path,
                         help='CSVモードで提案期間の予定として使うCSV（省略時は予定なしとして扱う）')
     parser.add_argument('--start', default=next_month.isoformat(), help='提案期間の開始日 (YYYY-MM-DD)')
-    parser.add_argument('--months', type=int, default=8, help='提案する月数')
+    parser.add_argument('--months', type=int, default=3, help='提案する月数')
     parser.add_argument('--rest-days', type=int, default=REST_DAYS,
                         help='トレーニングの間に空ける休息日数（0で連日も可）')
     parser.add_argument('--plot', action='store_true', help='トレーニング時間帯のヒストグラムを表示する')
@@ -376,6 +409,9 @@ def main():
 
     if source == 'google':
         history_df, future_df = load_from_google(year, start, end)
+    elif source == 'demo':
+        print('デモモード: synth.py の疑似カレンダーで学習・提案します')
+        history_df, future_df = load_demo(year, start, end)
     else:
         print(f'CSVモード: {args.history_csv} から学習します')
         history_df = load_events_csv(args.history_csv)
@@ -383,9 +419,12 @@ def main():
             future_df = load_events_csv(args.future_csv)
         else:
             print('提案期間の予定は未指定のため、すべて空いているものとして扱います')
-            future_df = pd.DataFrame(columns=['start', 'end', 'summary'])
+            future_df = empty_events()
 
-    model, training_events, metrics = train_model(history_df, year)
+    try:
+        model, training_events, metrics = train_model(history_df, year)
+    except ValueError as e:
+        raise SystemExit(str(e))
     print_metrics(metrics)
     if args.plot:
         plot_training_hours(training_events)
