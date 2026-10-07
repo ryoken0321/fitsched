@@ -25,18 +25,10 @@ FEATURES = ['hour', 'weekday', 'is_weekend', 'gap_before', 'gap_after', 'day_bus
 NO_EVENT_GAP = 24  # その日に前後の予定が無いときの間隔（時間）
 HOUR = pd.Timedelta(hours=1)
 
-# ユーザーが希望する月ごとのトレーニング回数（キーは月）
-MONTHLY_TRAINING_GOAL = {
-    1: 10,  # 1月に10回トレーニング
-    2: 8,   # 2月に8回トレーニング
-    3: 12,  # 3月に12回トレーニング
-    4: 8,
-    5: 6,
-    6: 8,
-    7: 11,
-    8: 8,
-}
-DEFAULT_MONTHLY_GOAL = 8  # 上に無い月の回数
+# 月ごとのトレーニング回数の目標。キーは月（例: {1: 10, 3: 12}）か (年, 月)。
+# ここに無い月は DEFAULT_MONTHLY_GOAL を使う（コマンドラインでは --goal で変更できる）
+MONTHLY_TRAINING_GOAL = {}
+DEFAULT_MONTHLY_GOAL = 8
 
 # 日ごとのトレーニング回数の上限
 DAILY_TRAINING_LIMIT = 1
@@ -102,7 +94,8 @@ def empty_events():
 
 def drop_all_day(df):
     """終日の予定（誕生日・祝日など）は時間を占有しないので除く。
-    0時ちょうどに始まって0時ちょうどに終わる予定を終日とみなす（保存済みCSVにも使えるように）"""
+    保存済みCSVでは終日予定も「0:00〜翌0:00」の日時になっているため、
+    Googleカレンダー・CSVのどちらでも「0時ちょうどに始まり0時ちょうどに終わる予定」を終日とみなす"""
     all_day = (df['start'] == df['start'].dt.normalize()) & (df['end'] == df['end'].dt.normalize())
     return df[~all_day].reset_index(drop=True)
 
@@ -120,7 +113,7 @@ def events_to_dataframe(events):
     df = pd.DataFrame(data, columns=['start', 'end', 'summary'])
     df['start'] = pd.to_datetime(df['start']).astype('datetime64[ns]')
     df['end'] = pd.to_datetime(df['end']).astype('datetime64[ns]')
-    return df
+    return drop_all_day(df)
 
 
 def load_events_csv(path):
@@ -240,14 +233,25 @@ def make_model():
     return RandomForestClassifier(n_estimators=300, min_samples_leaf=20, random_state=42, n_jobs=-1)
 
 
+def positive_proba(model, X):
+    """トレーニング（正例）である確率。学習データに正例が無いとクラスが1つしかないので0を返す"""
+    classes = list(model.classes_)
+    if 1 not in classes:
+        return np.zeros(len(X))
+    return model.predict_proba(X)[:, classes.index(1)]
+
+
 def cross_validate(table, features=FEATURES, model_factory=make_model):
-    """月ごとに分けた交差検証。評価する月のデータは学習に使わないので、隣の時間枠からの“答え漏れ”が起きない"""
+    """月ごとに分けた交差検証。評価する月のデータは学習に使わないので、
+    ランダムに分けるより隣の時間枠からの“答え漏れ”が起きにくい（月の境目の枠だけは隣の月と接する）"""
     groups = table['start'].dt.to_period('M')
+    if groups.nunique() < 2:
+        raise ValueError('交差検証には2か月以上の予定データが必要です。')
     n_splits = min(6, groups.nunique())
     oof = np.zeros(len(table))
     for train_idx, test_idx in GroupKFold(n_splits=n_splits).split(table, groups=groups):
         model = model_factory().fit(table.iloc[train_idx][features], table.iloc[train_idx]['is_training'])
-        oof[test_idx] = model.predict_proba(table.iloc[test_idx][features])[:, 1]
+        oof[test_idx] = positive_proba(model, table.iloc[test_idx][features])
     return oof
 
 
@@ -279,9 +283,22 @@ def print_metrics(metrics):
           f"(当てずっぽうなら {metrics['positive_rate']:.3f})")
 
 
-def monthly_goal(goals, year, month):
+def monthly_goal(goals, year, month, default=DEFAULT_MONTHLY_GOAL):
     """目標回数は (年, 月) → 月 → 既定値 の順で探す"""
-    return goals.get((year, month), goals.get(month, DEFAULT_MONTHLY_GOAL))
+    return goals.get((year, month), goals.get(month, default))
+
+
+def proposal_end(start, months):
+    """提案期間の終わり。開始月を1か月目として months か月分の月末まで（画面の月タブと揃える）"""
+    return start.to_period('M').start_time + pd.DateOffset(months=months)
+
+
+def goal_in_period(goals, year, month, start, end, default=DEFAULT_MONTHLY_GOAL):
+    """月の目標回数を、提案期間に入っている日数で按分する（月の途中から始めた月は目標を減らす）"""
+    m_start = pd.Timestamp(year, month, 1)
+    m_end = m_start + pd.DateOffset(months=1)
+    covered = max(min(end, m_end) - max(start, m_start), pd.Timedelta(0))
+    return round(monthly_goal(goals, year, month, default) * (covered / (m_end - m_start)))
 
 
 def scheduled_trainings(future_df, start, end):
@@ -291,7 +308,8 @@ def scheduled_trainings(future_df, start, end):
 
 
 def propose_slots(model, future_df, start, end, goals=MONTHLY_TRAINING_GOAL,
-                  daily_limit=DAILY_TRAINING_LIMIT, unwanted_hours=UNWANTED_HOURS, rest_days=REST_DAYS):
+                  daily_limit=DAILY_TRAINING_LIMIT, unwanted_hours=UNWANTED_HOURS, rest_days=REST_DAYS,
+                  default_goal=DEFAULT_MONTHLY_GOAL):
     """空いている時間帯から、トレーニング確率の高い順に月ごとの目標回数まで選ぶ。
 
     - カレンダーに入っているトレーニングは目標回数に数え、休息日の判定にも使う
@@ -301,7 +319,7 @@ def propose_slots(model, future_df, start, end, goals=MONTHLY_TRAINING_GOAL,
     # 予定がある時間帯を使用不可にする
     future_slots['available'] = (~overlap_mask(future_slots, future_df)).astype(int)
     future_slots = add_features(future_slots, future_df)
-    future_slots['proposed_training'] = model.predict_proba(future_slots[FEATURES])[:, 1]
+    future_slots['proposed_training'] = positive_proba(model, future_slots[FEATURES])
 
     candidates = future_slots[
         (future_slots['available'] == 1) & ~future_slots['hour'].isin(unwanted_hours)
@@ -318,7 +336,7 @@ def propose_slots(model, future_df, start, end, goals=MONTHLY_TRAINING_GOAL,
     for (year, month), month_slots in candidates.groupby(
             [candidates['start'].dt.year, candidates['start'].dt.month], sort=False):
         already = sum(n for d, n in day_count.items() if (d.year, d.month) == (year, month))
-        remaining = monthly_goal(goals, year, month) - already
+        remaining = goal_in_period(goals, year, month, start, end, default_goal) - already
         for gap in range(rest_days, -1, -1):
             for idx, slot in month_slots.iterrows():
                 if remaining <= 0:
@@ -362,10 +380,10 @@ def in_month(df, period):
     return df[(df['start'].dt.year == period.year) & (df['start'].dt.month == period.month)]
 
 
-def print_proposals(optimal_slots, scheduled, start, months):
+def print_proposals(optimal_slots, scheduled, start, end, months, default_goal=DEFAULT_MONTHLY_GOAL):
     """結果を月ごとに表示し、希望の回数を満たせない場合に通知する"""
     for period in pd.period_range(start=start, periods=months, freq='M'):
-        goal = monthly_goal(MONTHLY_TRAINING_GOAL, period.year, period.month)
+        goal = goal_in_period(MONTHLY_TRAINING_GOAL, period.year, period.month, start, end, default_goal)
         month_slots = in_month(optimal_slots, period)
         already = len(in_month(scheduled, period))
         label = f'{period.year}年{period.month}月'
@@ -378,9 +396,26 @@ def print_proposals(optimal_slots, scheduled, start, months):
             print(month_slots[['start', 'end', 'proposed_training']].to_string(index=False))
 
 
-def parse_args():
+def positive_int(value):
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError('1以上を指定してください')
+    return n
+
+
+def non_negative_int(value):
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError('0以上を指定してください')
+    return n
+
+
+def next_month_start():
     today = date.today()
-    next_month = date(today.year + today.month // 12, today.month % 12 + 1, 1)
+    return date(today.year + today.month // 12, today.month % 12 + 1, 1)
+
+
+def parse_args():
     parser = argparse.ArgumentParser(description='過去のカレンダーから最適なトレーニング時間を提案する')
     parser.add_argument('--source', choices=['auto', 'google', 'csv', 'demo'], default='auto',
                         help='auto: 認証情報があればGoogleカレンダー、保存済みCSVがあればCSV、無ければ疑似データのデモ')
@@ -389,10 +424,12 @@ def parse_args():
                         help='CSVモードで学習に使う予定データ')
     parser.add_argument('--future-csv', type=Path,
                         help='CSVモードで提案期間の予定として使うCSV（省略時は予定なしとして扱う）')
-    parser.add_argument('--start', default=next_month.isoformat(), help='提案期間の開始日 (YYYY-MM-DD)')
-    parser.add_argument('--months', type=int, default=3, help='提案する月数')
-    parser.add_argument('--rest-days', type=int, default=REST_DAYS,
+    parser.add_argument('--start', default=next_month_start().isoformat(), help='提案期間の開始日 (YYYY-MM-DD)')
+    parser.add_argument('--months', type=positive_int, default=3, help='提案する月数（開始月を含む）')
+    parser.add_argument('--rest-days', type=non_negative_int, default=REST_DAYS,
                         help='トレーニングの間に空ける休息日数（0で連日も可）')
+    parser.add_argument('--goal', type=non_negative_int, default=DEFAULT_MONTHLY_GOAL,
+                        help='1か月のトレーニング回数の目標（月の途中から始める月は日数で按分）')
     parser.add_argument('--plot', action='store_true', help='トレーニング時間帯のヒストグラムを表示する')
     return parser.parse_args()
 
@@ -404,7 +441,7 @@ def main():
         source = default_source()
 
     start = pd.Timestamp(args.start).normalize()
-    end = start + pd.DateOffset(months=args.months)
+    end = proposal_end(start, args.months)
     year = args.history_year
 
     if source == 'google':
@@ -429,8 +466,8 @@ def main():
     if args.plot:
         plot_training_hours(training_events)
 
-    optimal_slots = propose_slots(model, future_df, start, end, rest_days=args.rest_days)
-    print_proposals(optimal_slots, scheduled_trainings(future_df, start, end), start, args.months)
+    optimal_slots = propose_slots(model, future_df, start, end, rest_days=args.rest_days, default_goal=args.goal)
+    print_proposals(optimal_slots, scheduled_trainings(future_df, start, end), start, end, args.months, args.goal)
 
 
 if __name__ == '__main__':

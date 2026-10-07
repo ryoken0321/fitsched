@@ -8,6 +8,7 @@ import streamlit as st
 import fitsched as fs
 
 WEEKDAYS_JA = '月火水木金土日'
+SOURCE_LABELS = {'google': 'Googleカレンダー', 'csv': '保存済みCSV（予定なし扱い）', 'demo': 'デモ（疑似データ）'}
 PROPOSAL_COLOR = '#2a78d6'
 BUSY_COLOR = '#b5b4ad'
 SCHEDULED_COLOR = '#1baf7a'
@@ -27,11 +28,6 @@ def load_events(source, year, start, end):
 @st.cache_resource(show_spinner='過去のトレーニングから学習しています…')
 def train(history_df, year):
     return fs.train_model(history_df, year)
-
-
-def next_month_start():
-    today = date.today()
-    return date(today.year + today.month // 12, today.month % 12 + 1, 1)
 
 
 def day_label(ts):
@@ -86,7 +82,6 @@ def month_chart(busy, scheduled, proposals, month_start, hour_lo, hour_hi):
 # ---- サイドバー: 条件 ----
 with st.sidebar:
     st.header('条件')
-    SOURCE_LABELS = {'google': 'Googleカレンダー', 'csv': '保存済みCSV（予定なし扱い）', 'demo': 'デモ（疑似データ）'}
     sources = [s for s, ok in [('google', fs.CLIENT_SECRET_FILE.exists() or fs.TOKEN_FILE.exists()),
                                ('csv', fs.HISTORY_CSV.exists()), ('demo', True)] if ok]
     source = st.radio('データ', sources, format_func=SOURCE_LABELS.get,
@@ -97,19 +92,19 @@ with st.sidebar:
     try:
         default_start = date.fromisoformat(st.query_params.get('start', ''))
     except ValueError:
-        default_start = next_month_start()
+        default_start = fs.next_month_start()
     start_date = st.date_input('提案の開始日', value=default_start)
-    months = st.slider('提案する月数', 1, 12, 3)
+    months = st.slider('提案する月数（開始月を含む）', 1, 12, 3)
     hour_lo, hour_hi = st.slider('トレーニングしてよい時間帯', 0, 24, (6, 22), format='%d時')
     daily_limit = st.number_input('1日の上限（回）', 1, 3, fs.DAILY_TRAINING_LIMIT)
     rest_days = st.number_input('トレーニングの間の休息日数', 0, 6, fs.REST_DAYS,
                                 help='1なら連日にしない。休息日を守ると目標に届かない月は、自動で休息日を減らして埋めます。')
 
     start = pd.Timestamp(start_date)
-    end = start + pd.DateOffset(months=months)
+    end = fs.proposal_end(start, months)
     periods = pd.period_range(start=start, periods=months, freq='M')
 
-    st.subheader('月ごとの目標回数')
+    st.subheader('月ごとの目標回数', help='1か月あたりの回数。月の途中から始める月は、日数で按分した回数を目標にします。')
     goals = {}
     cols = st.columns(2)
     for i, p in enumerate(periods):
@@ -142,7 +137,8 @@ unwanted_hours = [h for h in range(24) if not hour_lo <= h < hour_hi]
 proposals = fs.propose_slots(model, future_df, start, end, goals, int(daily_limit), unwanted_hours, int(rest_days))
 scheduled = fs.scheduled_trainings(future_df, start, end)
 
-total_goal = sum(goals.values())
+period_goals = {(p.year, p.month): fs.goal_in_period(goals, p.year, p.month, start, end) for p in periods}
+total_goal = sum(period_goals.values())
 c1, c2, c3 = st.columns(3)
 c1.metric('予定済み + 提案 / 目標', f'{len(scheduled) + len(proposals)} / {total_goal}回',
           help=f'カレンダーに入っているトレーニング {len(scheduled)}回 + 提案 {len(proposals)}回')
@@ -165,17 +161,17 @@ tabs = st.tabs([f'{p.year}年{p.month}月' for p in periods])
 for tab, p in zip(tabs, periods):
     with tab:
         m_start = p.start_time
-        in_month = lambda df: df[(df['date'] >= m_start) & (df['date'] <= p.end_time)]
-        m_props = in_month(prop_all)
-        m_sched = in_month(scheduled_all)
+        within_month = lambda df: df[(df['date'] >= m_start) & (df['date'] <= p.end_time)]
+        m_props = within_month(prop_all)
+        m_sched = within_month(scheduled_all)
         already = len(fs.in_month(scheduled, p))
-        goal = goals[(p.year, p.month)]
+        goal = period_goals[(p.year, p.month)]
         if already:
             st.info(f'カレンダーに入っているトレーニング {already}回を目標に数えています。')
         if already + len(m_props) < goal:
             st.warning(f'目標 {goal}回に対して、予定済みと提案を合わせて {already + len(m_props)}回です。')
 
-        st.altair_chart(month_chart(in_month(busy_all), m_sched, m_props, m_start, hour_lo, hour_hi),
+        st.altair_chart(month_chart(within_month(busy_all), m_sched, m_props, m_start, hour_lo, hour_hi),
                         width='stretch')
 
         table = pd.DataFrame({

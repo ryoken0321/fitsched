@@ -1,5 +1,8 @@
-"""旧モデルと新モデルを、実データと疑似データで比べる（実行: python code/evaluate.py）
+"""初版のモデルと現在のモデルを、実データと疑似データで比べる（実行: python code/evaluate.py）
 
+初版（2024年）は、時刻・日・曜日・月だけを特徴量にし、24時間すべての枠をランダムに分けて評価していた。
+ランダムに分けると隣り合う時間枠から答えが漏れ、深夜のような簡単な枠も混ざるため、数値が実力より高く出る。
+ここでは初版の評価を再現したうえで、候補枠に絞って月ごとに分けた交差検証で比べ直す。
 実データ（data/2023_calendar_events.csv）が無い環境では疑似データだけで比べる。
 """
 import pandas as pd
@@ -16,7 +19,7 @@ LEGACY_FEATURES = ['hour', 'day', 'weekday', 'month']
 
 
 def legacy_reported_auc(history_df):
-    """旧コードの評価そのもの：全24時間の枠をランダムに分けて測る"""
+    """初版の評価方法の再現：全24時間の枠をランダムに分けて測る"""
     slots = fs.create_slots(f'{YEAR}-01-01', f'{YEAR + 1}-01-01')
     slots['is_training'] = fs.overlap_mask(slots, history_df[fs.is_training_event(history_df)]).astype(int)
     slots['hour'] = slots['start'].dt.hour
@@ -53,9 +56,9 @@ def evaluate(name, history_df, truth_df=None):
         truth = table[['start']].merge(truth_df, on='start', how='left')['true_prob'].fillna(0).to_numpy()
 
     rows = {
-        '旧モデル（旧評価のまま）': {'ROC-AUC': legacy_reported_auc(history_df)},
-        '旧特徴量': scores(table, fs.cross_validate(table, LEGACY_FEATURES, legacy_model), truth),
-        '新モデル': scores(table, fs.cross_validate(table), truth),
+        '初版（ランダム分割の評価）': {'ROC-AUC': legacy_reported_auc(history_df)},
+        '初版の特徴量': scores(table, fs.cross_validate(table, LEGACY_FEATURES, legacy_model), truth),
+        '現在のモデル': scores(table, fs.cross_validate(table), truth),
     }
     if truth is not None:
         rows['正解の確率（上限）'] = scores(table, truth, truth)
@@ -66,7 +69,7 @@ def evaluate(name, history_df, truth_df=None):
 
 
 def main():
-    print('旧評価以外は、候補枠（6〜22時・他の予定なし）で月ごとに分けた交差検証。AP の当てずっぽう値はトレーニング枠の割合。')
+    print('初版（ランダム分割の評価）以外は、候補枠（6〜22時・他の予定なし）で月ごとに分けた交差検証。AP の当てずっぽう値はトレーニング枠の割合。')
     if fs.HISTORY_CSV.exists():
         evaluate('実データ 2023年', fs.load_events_csv(fs.HISTORY_CSV))
     for seed in range(3):
